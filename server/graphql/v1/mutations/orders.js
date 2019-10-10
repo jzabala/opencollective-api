@@ -2,7 +2,7 @@ import moment from 'moment';
 import uuidv4 from 'uuid/v4';
 import debugLib from 'debug';
 import Promise from 'bluebird';
-import { pick, omit, get, isNil } from 'lodash';
+import { omit, get, isNil } from 'lodash';
 import config from 'config';
 import * as LibTaxes from '@opencollective/taxes';
 
@@ -257,10 +257,13 @@ export async function createOrder(order, loaders, remoteUser, reqIp) {
       if (existingUser) {
         throw new Error('An account already exists for this email address. Please login.');
       }
+      if (!remoteUser) {
+        throw new Error('You have to be authenticated. Please login.');
+      }
       user = await models.User.createUserWithCollective({
         ...order.user,
         currency: order.currency,
-        CreatedByUserId: remoteUser ? remoteUser.id : null,
+        CreatedByUserId: remoteUser.id,
       });
     } else if (remoteUser) {
       user = remoteUser;
@@ -282,7 +285,7 @@ export async function createOrder(order, loaders, remoteUser, reqIp) {
         throw new Error(`From collective id ${order.fromCollective.id} not found`);
       }
 
-      const possibleRoles = [roles.ADMIN, roles.HOST];
+      const possibleRoles = [roles.ADMIN];
       if (fromCollective.type === types.ORGANIZATION) {
         possibleRoles.push(roles.MEMBER);
       }
@@ -475,11 +478,7 @@ export async function createOrder(order, loaders, remoteUser, reqIp) {
         await orderCreated.setPaymentMethod(order.paymentMethod);
       }
       // also adds the user as a BACKER of collective
-      await libPayments.executeOrder(
-        remoteUser || user,
-        orderCreated,
-        pick(order, ['hostFeePercent', 'platformFeePercent']),
-      );
+      await libPayments.executeOrder(remoteUser || user, orderCreated);
     } else if (!paymentRequired && order.interval && collective.type === types.COLLECTIVE) {
       // create inactive subscription to hold the interval info for the pledge
       const subscription = await models.Subscription.create({
@@ -601,23 +600,17 @@ export async function confirmOrder(order, remoteUser) {
 }
 
 export async function completePledge(remoteUser, order) {
-  if (!remoteUser) {
-    throw new errors.Unauthorized({
-      message: 'You need to be logged in to update an order',
-    });
-  }
-
   const existingOrder = await models.Order.findOne({
-    where: {
-      id: order.id,
-    },
+    where: { id: order.id },
     include: [{ model: models.Collective, as: 'collective' }, { model: models.Collective, as: 'fromCollective' }],
   });
 
   if (!existingOrder) {
-    throw new errors.NotFound({
-      message: 'Existing order not found',
-    });
+    throw new errors.NotFound({ message: "This order doesn't exist" });
+  } else if (!remoteUser || !remoteUser.isAdmin(existingOrder.FromCollectiveId)) {
+    throw new errors.Unauthorized({ message: "You don't have the permissions to edit this order" });
+  } else if (existingOrder.status !== status.PENDING) {
+    throw new errors.NotFound({ message: 'This pledge has already been completed' });
   }
 
   const paymentRequired = order.totalAmount > 0 && existingOrder.collective.isActive;
@@ -635,14 +628,16 @@ export async function completePledge(remoteUser, order) {
   }
 
   if (paymentRequired) {
+    existingOrder.totalAmount = order.totalAmount;
     existingOrder.interval = order.interval;
+    existingOrder.currency = order.currency;
     if (get(order, 'paymentMethod.type') === 'manual') {
       existingOrder.paymentMethod = order.paymentMethod;
     } else {
       await existingOrder.setPaymentMethod(order.paymentMethod);
     }
     // also adds the user as a BACKER of collective
-    await libPayments.executeOrder(remoteUser, existingOrder, pick(order, ['hostFeePercent', 'platformFeePercent']));
+    await libPayments.executeOrder(remoteUser, existingOrder);
   }
   await existingOrder.reload();
   return existingOrder;
@@ -997,21 +992,27 @@ export async function addFundsToCollective(order, remoteUser) {
     currency: collective.currency,
     description: order.description,
     status: status.PENDING,
+    data: {},
   };
 
+  // Handle specific fees
+  if (order.hostFeePercent) {
+    orderData.data.hostFeePercent = order.hostFeePercent;
+  }
+  if (order.platformFeePercent) {
+    orderData.data.platformFeePercent = order.platformFeePercent;
+  }
+
   const orderCreated = await models.Order.create(orderData);
+
   await orderCreated.setPaymentMethod(order.paymentMethod);
 
   try {
-    await libPayments.executeOrder(
-      remoteUser || user,
-      orderCreated,
-      pick(order, ['hostFeePercent', 'platformFeePercent']),
-    );
+    await libPayments.executeOrder(remoteUser || user, orderCreated);
   } catch (e) {
     // Don't save new card for user if order failed
     if (!order.paymentMethod.id && !order.paymentMethod.uuid) {
-      await orderCreated.paymentMethod.update({ CollectiveId: null });
+      await orderCreated.paymentMethod.destroy();
     }
     throw e;
   }
